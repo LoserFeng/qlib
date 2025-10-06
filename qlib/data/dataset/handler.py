@@ -4,14 +4,18 @@
 # coding=utf-8
 from abc import abstractmethod
 import warnings
+import os
+import pickle
+from pathlib import Path
 from typing import Callable, Union, Tuple, List, Iterator, Optional
 
 import pandas as pd
 
 from qlib.typehint import Literal
 from ...log import get_module_logger, TimeInspector
-from ...utils import init_instance_by_config
+from ...utils import init_instance_by_config, hash_args
 from ...utils.serial import Serializable
+from ...config import C
 from .utils import fetch_df_by_index, fetch_df_by_col
 from ...utils import lazy_sort_index
 from .loader import DataLoader
@@ -148,7 +152,7 @@ class DataHandler(DataHandlerABC):
         self.fetch_orig = fetch_orig
         if init_data:
             with TimeInspector.logt("Init data"):
-                self.setup_data()
+                self.setup_data(enable_cache=True)
         super().__init__()
 
     def config(self, **kwargs):
@@ -171,6 +175,55 @@ class DataHandler(DataHandlerABC):
 
         super().config(**kwargs)
 
+    def _get_cache_file_path(self, cache_dir: str = None) -> Path:
+        """
+        Generate cache file path based on handler configuration
+        
+        Parameters
+        ----------
+        cache_dir : str
+            Cache directory path. If None, use default from config
+        
+        Returns
+        -------
+        Path
+            Path to the cache file
+        """
+        if cache_dir is None:
+            # Use default cache directory from config
+            if hasattr(C, 'get') and callable(C.get):
+                cache_base = C.get("local_cache_path", None)
+            else:
+                cache_base = getattr(C, "local_cache_path", None)
+            
+            if cache_base is None:
+                # Fallback to a default cache directory
+                from tempfile import gettempdir
+                cache_base = Path(gettempdir()) / "qlib_cache"
+            else:
+                cache_base = Path(cache_base)
+            
+            cache_dir = cache_base / "handler_cache"
+        else:
+            cache_dir = Path(cache_dir)
+        
+        # Create cache directory if it doesn't exist
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate hash based on handler configuration
+        cache_key_components = [
+            str(self.instruments),
+            str(self.start_time), 
+            str(self.end_time),
+            str(type(self.data_loader)),
+            getattr(self.data_loader, '__dict__', {})
+        ]
+        
+        cache_hash = hash_args(*cache_key_components)
+        cache_filename = f"handler_data_{cache_hash[:16]}.pkl"
+        
+        return cache_dir / cache_filename
+
     def setup_data(self, enable_cache: bool = False):
         """
         Set Up the data in case of running initialization for multiple time
@@ -188,12 +241,37 @@ class DataHandler(DataHandlerABC):
                 the processed data will be saved on disk, and handler will load the cached data from the disk directly
                 when we call `init` next time
         """
-        # Setup data.
+        # Setup data with caching support
+        if enable_cache:
+            cache_file_path = self._get_cache_file_path()
+            
+            # Try to load from cache first
+            if cache_file_path.exists():
+                try:
+                    with TimeInspector.logt("Loading data from cache"):
+                        with open(cache_file_path, 'rb') as f:
+                            self._data = pickle.load(f)
+                        get_module_logger("DataHandler").info(f"Successfully loaded data from cache: {cache_file_path}")
+                    return
+                except Exception as e:
+                    get_module_logger("DataHandler").warning(f"Failed to load cache file {cache_file_path}: {e}. Loading data from source.")
+        
+        # Load data from source (either cache disabled or cache loading failed)
         # _data may be with multiple column index level. The outer level indicates the feature set name
-        with TimeInspector.logt("Loading data"):
+        with TimeInspector.logt("Loading data from source"):
             # make sure the fetch method is based on an index-sorted pd.DataFrame
             self._data = lazy_sort_index(self.data_loader.load(self.instruments, self.start_time, self.end_time))
-        # TODO: cache
+        
+        # Save to cache if enabled
+        if enable_cache:
+            try:
+                cache_file_path = self._get_cache_file_path()
+                with TimeInspector.logt("Saving data to cache"):
+                    with open(cache_file_path, 'wb') as f:
+                        pickle.dump(self._data, f, protocol=getattr(C, "dump_protocol_version", pickle.HIGHEST_PROTOCOL))
+                    get_module_logger("DataHandler").info(f"Successfully saved data to cache: {cache_file_path}")
+            except Exception as e:
+                get_module_logger("DataHandler").warning(f"Failed to save data to cache: {e}")
 
     def fetch(
         self,
@@ -626,6 +704,61 @@ class DataHandlerLP(DataHandler):
             for processor in self.get_all_processors():
                 processor.config(**processor_kwargs)
 
+    def _get_processed_cache_file_path(self, cache_dir: str = None) -> Path:
+        """
+        Generate cache file path for processed data (infer and learn data)
+        
+        Parameters
+        ----------
+        cache_dir : str
+            Cache directory path. If None, use default from config
+        
+        Returns
+        -------
+        Path
+            Path to the cache file for processed data
+        """
+        if cache_dir is None:
+            # Use default cache directory from config
+            if hasattr(C, 'get') and callable(C.get):
+                cache_base = C.get("local_cache_path", None)
+            else:
+                cache_base = getattr(C, "local_cache_path", None)
+            
+            if cache_base is None:
+                # Fallback to a default cache directory
+                from tempfile import gettempdir
+                cache_base = Path(gettempdir()) / "qlib_cache"
+            else:
+                cache_base = Path(cache_base)
+            
+            cache_dir = cache_base / "handler_lp_cache"
+        else:
+            cache_dir = Path(cache_dir)
+        
+        # Create cache directory if it doesn't exist
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate hash based on handler configuration including processors
+        cache_key_components = [
+            str(self.instruments),
+            str(self.start_time), 
+            str(self.end_time),
+            str(type(self.data_loader)),
+            getattr(self.data_loader, '__dict__', {}),
+            # Include processor configurations in cache key
+            [proc.__class__.__name__ + str(getattr(proc, '__dict__', {})) for proc in self.shared_processors],
+            [proc.__class__.__name__ + str(getattr(proc, '__dict__', {})) for proc in self.infer_processors],
+            [proc.__class__.__name__ + str(getattr(proc, '__dict__', {})) for proc in self.learn_processors],
+            self.process_type,
+            self.drop_raw
+        ]
+        
+        cache_hash = hash_args(*cache_key_components)
+        cache_filename = f"handler_lp_processed_{cache_hash[:16]}.pkl"
+        
+        return cache_dir / cache_filename
+
     # init type
     IT_FIT_SEQ = "fit_seq"  # the input of `fit` will be the output of the previous processor
     IT_FIT_IND = "fit_ind"  # the input of `fit` will be the original df
@@ -647,7 +780,36 @@ class DataHandlerLP(DataHandler):
                 the processed data will be saved on disk, and handler will load the cached data from the disk directly
                 when we call `init` next time
         """
-        # init raw data
+        # Extract enable_cache from kwargs
+        enable_cache = kwargs.get('enable_cache', False)
+        
+        # Try to load processed data from cache first
+        if enable_cache:
+            processed_cache_file = self._get_processed_cache_file_path()
+            
+            if processed_cache_file.exists():
+                try:
+                    with TimeInspector.logt("Loading processed data from cache"):
+                        with open(processed_cache_file, 'rb') as f:
+                            cached_data = pickle.load(f)
+                            
+                        # Restore processed data from cache
+                        self._infer = cached_data['infer']
+                        self._learn = cached_data['learn']
+                        
+                        # Only restore raw data if not dropped and available in cache
+                        if not self.drop_raw and 'raw' in cached_data:
+                            self._data = cached_data['raw']
+                        elif not self.drop_raw:
+                            # If raw data is needed but not in cache, load it separately
+                            super().setup_data(**kwargs)
+                            
+                        get_module_logger("DataHandlerLP").info(f"Successfully loaded processed data from cache: {processed_cache_file}")
+                    return
+                except Exception as e:
+                    get_module_logger("DataHandlerLP").warning(f"Failed to load processed cache file {processed_cache_file}: {e}. Processing data from source.")
+        
+        # init raw data (either cache disabled or cache loading failed)
         super().setup_data(**kwargs)
 
         with TimeInspector.logt("fit & process data"):
@@ -661,7 +823,25 @@ class DataHandlerLP(DataHandler):
             else:
                 raise NotImplementedError(f"This type of input is not supported")
 
-        # TODO: Be able to cache handler data. Save the memory for data processing
+        # Save processed data to cache if enabled
+        if enable_cache:
+            try:
+                processed_cache_file = self._get_processed_cache_file_path()
+                cache_data = {
+                    'infer': self._infer,
+                    'learn': self._learn
+                }
+                
+                # Only cache raw data if not dropped
+                if not self.drop_raw and hasattr(self, '_data'):
+                    cache_data['raw'] = self._data
+                
+                with TimeInspector.logt("Saving processed data to cache"):
+                    with open(processed_cache_file, 'wb') as f:
+                        pickle.dump(cache_data, f, protocol=getattr(C, "dump_protocol_version", pickle.HIGHEST_PROTOCOL))
+                    get_module_logger("DataHandlerLP").info(f"Successfully saved processed data to cache: {processed_cache_file}")
+            except Exception as e:
+                get_module_logger("DataHandlerLP").warning(f"Failed to save processed data to cache: {e}")
 
     def _get_df_by_key(self, data_key: DATA_KEY_TYPE = DataHandlerABC.DK_I) -> pd.DataFrame:
         if data_key == self.DK_R and self.drop_raw:
