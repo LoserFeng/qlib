@@ -65,7 +65,7 @@ class BaseCollector(abc.ABC):
             using for debug, by default None
         """
         self.save_dir = Path(save_dir).expanduser().resolve()
-        self.save_dir.mkdir(parents=True, exist_ok=True)  # stock_data/source/cn_data
+        self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.delay = delay
         self.max_workers = max_workers

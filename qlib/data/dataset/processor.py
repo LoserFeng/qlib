@@ -356,6 +356,7 @@ class CSRankNorm(Processor):
         t -= 0.5
         t *= 3.46  # NOTE: towards unit std
         df[cols] = t
+        # df.loc[:, cols] = t # Fix SettingWithCopyWarning
         return df
 
 

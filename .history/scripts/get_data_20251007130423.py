@@ -6,4 +6,4 @@ from qlib.tests.data import GetData
 
 
 if __name__ == "__main__":
-    fire.Fire(GetData)  # 第一个参数是方法名qlib_data or download_data
+    fire.Fire(GetData)
